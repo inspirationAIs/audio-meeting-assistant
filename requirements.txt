@@ -1,0 +1,6 @@
+streamlit
+google-genai
+notion-client
+python-dotenv
+requests
+pydantic
