@@ -1,5 +1,7 @@
 import os
+import re
 import tempfile
+from datetime import datetime
 import streamlit as st
 from google import genai
 from google.genai import types
@@ -12,6 +14,24 @@ env_path = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(env_path)
 
 DEPARTMENTS = ["NW망", "DC운영", "DC구축", "재무/투자심의", "전략기획", "법무", "구매", "영업", "경영진"]
+
+def extract_date_from_filename(filename: str) -> str:
+    if not filename:
+        return datetime.now().strftime("%y%m%d")
+    # 1. 스마트폰 통화 녹음 형식: _YYMMDD_ (예: 통화 박진만 매니저_261006_161815)
+    call_match = re.search(r'_(\d{6})_', filename)
+    if call_match:
+        return call_match.group(1)
+    # 2. 8자리 날짜: 20261006, 2024-10-06 등
+    match8 = re.search(r'20(\d{2})[-._]?(0[1-9]|1[0-2])[-._]?(0[1-9]|[12]\d|3[01])', filename)
+    if match8:
+        return f"{match8.group(1)}{match8.group(2)}{match8.group(3)}"
+    # 3. 6자리 날짜: YYMMDD
+    match6 = re.search(r'(?:^|[^\d])(\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))(?:[^\d]|$)', filename)
+    if match6:
+        return match6.group(1)
+    # 4. 없으면 오늘 날짜 (YYMMDD)
+    return datetime.now().strftime("%y%m%d")
 
 class TodoItem(BaseModel):
     task_name: str
@@ -103,20 +123,26 @@ def create_dbs_in_page(notion_token, min_page_id, todo_page_id):
     
     return min_db["id"], todo_db["id"]
 
-def process_audio(api_key, audio_file_path, mime_type):
+def process_audio(api_key, audio_file_path, mime_type, original_filename=""):
     client = genai.Client(api_key=api_key)
+    file_date = extract_date_from_filename(original_filename)
     
     uploaded_file = client.files.upload(file=audio_file_path, config={'mime_type': mime_type})
     
-    prompt = """
+    prompt = f"""
     당신은 LG유플러스의 '글로벌 AI/Data Center 인프라 Business Development 수석 전문가'이자 전담 비서입니다.
     주요 업무 맥락은 Microsoft, AWS, Google, Meta 등 글로벌 CSP 대상 사업개발 및 이를 지원하는 사내 유관 부서(NW망, DC운영/구축, 재무/투자심의 등)와의 전략적 협의입니다.
 
     제공된 음성 파일을 바탕으로 회의록과 To-Do 리스트를 도출하세요.
+    [업로드 원본 파일명] {original_filename}
 
     [회의록 제목 (meeting_title) 작성 규칙]
-    - 반드시 "[YYMMDD] 핵심 주제" 형식으로 작성하세요. (예: [241010] Google 망 연동 RFS 일정 협의)
-    - 날짜는 음성 내용이나 현재 시점을 추정하여 작성하되 모르면 [날짜미상]으로 적습니다.
+    - 반드시 "[YYMMDD] 핵심 주제" 형식으로 작성하세요. (예: [{file_date}] Google 망 연동 RFS 일정 협의)
+    - [날짜 6자리(YYMMDD) 결정 기준 - 매우 중요]
+      1순위: 파일명('{original_filename}')에서 추출된 날짜 '{file_date}'를 최우선으로 반드시 반영하세요.
+      2순위: 음성 대화 내용에 다른 날짜가 구체적으로 언급된 경우 그 날짜를 YYMMDD 6자리로 변환
+      3순위: 위 두 곳 모두 날짜 정보가 전혀 없다면 오늘 날짜 '{datetime.now().strftime("%y%m%d")}' 사용
+      * 주의: 절대로 '[날짜미상]'이라고 적지 마시고 반드시 6자리 숫자(YYMMDD)로 시작하세요!
 
     [To-Do 리스트 분류 카테고리]
     도출된 각 To-Do는 반드시 다음 4가지 카테고리 중 하나로만 분류하세요:
@@ -163,7 +189,15 @@ def process_audio(api_key, audio_file_path, mime_type):
                 raise e
                 
     client.files.delete(name=uploaded_file.name)
-    return response.parsed
+    parsed = response.parsed
+    # 제목 날짜 검증 및 보정 (2중 안전장치: 혹시라도 [날짜미상]이거나 [YYMMDD] 누락 시 자동 교정)
+    if parsed and parsed.meeting_title:
+        clean_title = parsed.meeting_title.strip()
+        if "[날짜미상]" in clean_title:
+            parsed.meeting_title = clean_title.replace("[날짜미상]", f"[{file_date}]")
+        elif not re.match(r"^\[\d{6}\]", clean_title):
+            parsed.meeting_title = f"[{file_date}] {clean_title}"
+    return parsed
 
 def add_notion_meeting_minutes(notion_token, db_id, title, markdown_content):
     notion = Client(auth=notion_token)
@@ -370,7 +404,7 @@ if st.button("분석 및 노션 업데이트 시작", type="primary") and upload
                 tmp_path = tmp_file.name
 
             try:
-                result = process_audio(gemini_api_key, tmp_path, mime_type)
+                result = process_audio(gemini_api_key, tmp_path, mime_type, uploaded_audio.name)
                 st.success("✅ 분석 완료! 노션에 업로드를 시작합니다.")
                 
                 st.subheader("📝 생성된 회의록 요약 (미리보기)")
