@@ -11,9 +11,12 @@ from dotenv import load_dotenv, set_key
 env_path = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(env_path)
 
+DEPARTMENTS = ["NW망", "DC운영", "DC구축", "재무/투자심의", "전략기획", "법무", "구매", "영업", "경영진"]
+
 class TodoItem(BaseModel):
     task_name: str
     category: str
+    related_departments: List[str]
     assignee: str
     deadline: str
 
@@ -53,9 +56,11 @@ def create_dbs_in_page(notion_token, min_page_id, todo_page_id):
     
     min_data = {
         "parent": {"type": "page_id", "page_id": min_page_id},
-        "title": [{"type": "text", "text": {"content": "자동생성: 회의록 DB"}}],
+        "is_inline": True,
+        "title": [{"type": "text", "text": {"content": "📝 회의록"}}],
         "properties": {
-            "Title": {"title": {}}
+            "회의 제목": {"title": {}},
+            "등록일": {"created_time": {}}
         }
     }
     res_min = requests.post(url, headers=headers, json=min_data)
@@ -63,10 +68,11 @@ def create_dbs_in_page(notion_token, min_page_id, todo_page_id):
     
     todo_data = {
         "parent": {"type": "page_id", "page_id": todo_page_id},
-        "title": [{"type": "text", "text": {"content": "자동생성: To-Do DB"}}],
+        "is_inline": True,
+        "title": [{"type": "text", "text": {"content": "✅ To-Do 통합 현황"}}],
         "properties": {
-            "Task Name": {"title": {}},
-            "Category": {
+            "작업명": {"title": {}},
+            "분류": {
                 "select": {
                     "options": [
                         {"name": "CSP / 고객사", "color": "blue"},
@@ -76,9 +82,20 @@ def create_dbs_in_page(notion_token, min_page_id, todo_page_id):
                     ]
                 }
             },
-            "Assignee": {"rich_text": {}},
-            "Deadline": {"rich_text": {}},
-            "Related Meeting": {"url": {}}
+            "유관부서": {"multi_select": {"options": [{"name": d} for d in DEPARTMENTS]}},
+            "담당자": {"rich_text": {}},
+            "기한": {"rich_text": {}},
+            "완료": {"checkbox": {}},
+            "진행률": {"select": {"options": [
+                {"name": "0%", "color": "gray"},
+                {"name": "25%", "color": "red"},
+                {"name": "50%", "color": "orange"},
+                {"name": "75%", "color": "yellow"},
+                {"name": "100%", "color": "green"}
+            ]}},
+            "비고": {"rich_text": {}},
+            "관련 회의록": {"url": {}},
+            "등록일": {"created_time": {}}
         }
     }
     res_todo = requests.post(url, headers=headers, json=todo_data)
@@ -107,6 +124,11 @@ def process_audio(api_key, audio_file_path, mime_type):
     2. "내부 유관부서" (NW망, DC운영/구축 등 기술 부서와의 물리적/기술적 협업)
     3. "투자 / 경영진 보고" (CAPEX 검토, 투자심의, 임원 보고, 재무적 의사결정)
     4. "팀 내 실무" (일반 팔로업, 내부 리서치, 단순 자료 취합)
+
+    [유관부서 (related_departments) 작성 규칙]
+    - 해당 To-Do 수행 시 협업/보고가 필요한 사내 부서를 배열로 적습니다.
+    - 가급적 다음 중에서 선택하세요: NW망, DC운영, DC구축, 재무/투자심의, 전략기획, 법무, 구매, 영업, 경영진
+    - 목록에 없는 부서가 명확히 언급되면 그 이름을 짧게 그대로 적고, 관련 부서가 없으면 빈 배열로 둡니다.
 
     [핵심 작성 원칙]
     - To-Do 가시성 극대화: 누가 무엇을 언제까지 해야 하는지 선명하게 도출합니다.
@@ -170,10 +192,13 @@ def add_notion_todo(notion_token, db_id, todo: TodoItem, meeting_url: str = ""):
         parent={"database_id": db_id},
         properties={
             "title": {"title": [{"text": {"content": todo.task_name}}]},
-            "Category": {"select": {"name": todo.category}},
-            "Assignee": {"rich_text": [{"text": {"content": todo.assignee}}]},
-            "Deadline": {"rich_text": [{"text": {"content": todo.deadline}}]},
-            "Related Meeting": {"url": meeting_url if meeting_url else None}
+            "분류": {"select": {"name": todo.category}},
+            "유관부서": {"multi_select": [{"name": d.replace(",", "/")[:100]} for d in todo.related_departments if d.strip()]},
+            "담당자": {"rich_text": [{"text": {"content": todo.assignee}}]},
+            "기한": {"rich_text": [{"text": {"content": todo.deadline}}]},
+            "완료": {"checkbox": False},
+            "진행률": {"select": {"name": "0%"}},
+            "관련 회의록": {"url": meeting_url if meeting_url else None}
         }
     )
 
