@@ -151,41 +151,53 @@ def create_minutes_db_in_page(notion_token: str, min_page_id: str) -> str:
 
 
 def ensure_minutes_db(notion_token: str, db_id: str) -> str:
-    """회의록 DB가 존재하는지 확인하고,(일시/대화자/목적/상태) 속성을 자동 보장합니다.
-    만약 기존 회의록 DB가 삭제되었더라도 '회의록' 페이지를 찾아 자동 복구합니다."""
+    """회의록 DB가 존재하는지 확인하고, (일시/대화자/목적/상태) 속성을 자동 보장합니다.
+    절대로 To-do 페이지 안에 회의록 DB를 중복 생성하지 않습니다."""
     headers = _notion_headers(notion_token)
+    todo_db_id = os.getenv("NOTION_TODOS_DB_ID", "")
+    todo_parent_page_id = None
+    if todo_db_id:
+        r_td = requests.get(f"https://api.notion.com/v1/databases/{todo_db_id}", headers=headers)
+        if r_td.status_code == 200:
+            todo_parent_page_id = r_td.json().get("parent", {}).get("page_id")
+
     target_db_id = db_id
 
-    # 1. 기존 db_id가 유효한지 확인
+    # 1. 기존 db_id가 유효한지 확인 (단, To-do 페이지 하위에 잘못 생성된 DB는 제외)
     is_valid = False
     if target_db_id:
         r = requests.get(f"https://api.notion.com/v1/databases/{target_db_id}", headers=headers)
         if r.status_code == 200:
             db_info = r.json()
-            if not db_info.get("archived") and not db_info.get("in_trash"):
+            parent_pid = db_info.get("parent", {}).get("page_id")
+            if not db_info.get("archived") and not db_info.get("in_trash") and parent_pid != todo_parent_page_id:
                 is_valid = True
 
-    # 2. 유효하지 않다면 노션에서 살아있는 '회의록' DB 또는 '회의록' 페이지 탐색
+    # 2. 유효하지 않다면 노션에서 '회의록' 페이지 안의 회의록 DB 탐색
     if not is_valid:
         s_res = requests.post("https://api.notion.com/v1/search", headers=headers, json={}).json()
         results = s_res.get("results", [])
 
-        # (a) 살아있는 회의록 DB 찾기
+        # (a) To-do 페이지가 아닌 곳에 있는 살아있는 '회의록' DB 찾기
         for item in results:
             if item.get("object") == "database" and not item.get("archived") and not item.get("in_trash"):
+                parent_pid = item.get("parent", {}).get("page_id")
+                if todo_parent_page_id and parent_pid == todo_parent_page_id:
+                    continue
                 t_str = "".join([t.get("plain_text", "") for t in item.get("title", [])])
                 if "회의록" in t_str:
                     target_db_id = item["id"]
                     is_valid = True
                     break
 
-        # (b) 없으면 '회의록' 이름의 일반 페이지 안에 새로 생성
+        # (b) 없으면 '회의록' 이름의 일반 페이지 안에만 생성 (절대 To-do 페이지에는 생성하지 않음)
         if not is_valid:
             candidate_page_id = None
-            fallback_page_id = None
             for item in results:
                 if item.get("object") == "page" and not item.get("archived") and not item.get("in_trash"):
                     if item.get("parent", {}).get("type") == "database_id":
+                        continue
+                    if todo_parent_page_id and item["id"] == todo_parent_page_id:
                         continue
                     p_title = ""
                     for _, v in item.get("properties", {}).items():
@@ -194,16 +206,15 @@ def ensure_minutes_db(notion_token: str, db_id: str) -> str:
                     if "회의록" in p_title:
                         candidate_page_id = item["id"]
                         break
-                    if not fallback_page_id:
-                        fallback_page_id = item["id"]
 
-            parent_page = candidate_page_id or fallback_page_id
-            if parent_page:
-                target_db_id = create_minutes_db_in_page(notion_token, parent_page)
+            if candidate_page_id:
+                target_db_id = create_minutes_db_in_page(notion_token, candidate_page_id)
                 is_valid = True
-                if os.path.exists(env_path):
-                    set_key(env_path, "NOTION_MINUTES_DB_ID", target_db_id)
-                os.environ["NOTION_MINUTES_DB_ID"] = target_db_id
+            else:
+                raise RuntimeError(
+                    "노션의 '회의록' 페이지(또는 회의록 DB)에 봇(VoiceAgent) 연결이 되어 있지 않아 접근할 수 없습니다. "
+                    "노션 왼쪽 메뉴의 [회의록] 페이지로 들어가셔서 우측 상단 점 3개(...) ➔ [연결(Connections)] ➔ [VoiceAgent]를 추가해 주세요!"
+                )
 
     # 3. 속성(일시 / 대화자 / 목적 / 상태 / 등록일) 스키마 패치 보장
     if is_valid and target_db_id:
