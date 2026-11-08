@@ -20,13 +20,24 @@ from dotenv import load_dotenv, set_key
 env_path = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(env_path)
 
+
+def get_secret(key: str, default: str = "") -> str:
+    """Streamlit Secrets 및 OS 환경 변수를 안전하게 조회합니다."""
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+
 DEPARTMENTS = ["NW망", "DC운영", "DC구축", "재무/투자심의", "전략기획", "법무", "구매", "영업", "경영진"]
 
-# AI 설정: 기본은 Groq 무료 플랜(OpenAI 호환 API). 환경변수로 교체 가능.
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1")
-TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
-LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
-TPM_BUDGET = int(os.getenv("TPM_BUDGET", "6500"))  # 무료 8,000 TPM 보다 여유 있게
+# AI 설정: 기본은 Groq 무료 플랜(OpenAI 호환 API). 환경변수/Secrets로 교체 가능.
+AI_BASE_URL = get_secret("AI_BASE_URL", "https://api.groq.com/openai/v1")
+TRANSCRIBE_MODEL = get_secret("TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
+LLM_MODEL = get_secret("LLM_MODEL", "openai/gpt-oss-120b")
+TPM_BUDGET = int(get_secret("TPM_BUDGET", "6500"))  # 무료 8,000 TPM 보다 여유 있게
 DIRECT_MAX_CHARS = 3000      # 이보다 짧으면 요약 단계 없이 바로 구조화
 PIECE_MAX_CHARS = 4500       # 구간 요약 입력 최대 글자 수
 NOTES_TOTAL_CHARS = 2400     # 구간 요약 노트 전체 합계(최종 호출 토큰 제한 대응)
@@ -856,12 +867,13 @@ st.markdown(
         border-radius: 4px !important;
     }
     
-    /* 파일 업로더 큼직하고 세련되게 */
+    /* 파일 업로더 모바일 및 데스크톱 반응형 스타일 */
     [data-testid="stFileUploadDropzone"] {
         border-radius: 12px !important;
         background-color: #181818 !important;
         border: 2px dashed #404040 !important;
-        padding: 3rem !important;
+        padding: 1.5rem 1rem !important;
+        text-align: center !important;
     }
     [data-testid="stFileUploadDropzone"]:hover {
         border-color: #1DB954 !important;
@@ -872,7 +884,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+APP_PASSWORD = get_secret("APP_PASSWORD", "")
 if APP_PASSWORD and not st.session_state.get("authed"):
     st.title("🔒 접속 비밀번호")
     _pw = st.text_input("비밀번호를 입력하세요", type="password")
@@ -893,10 +905,10 @@ st.markdown(
 with st.sidebar:
     st.header("⚙️ 설정 (Settings)")
 
-    saved_ai_key = os.getenv("GROQ_API_KEY", "")
-    saved_notion_token = os.getenv("NOTION_API_TOKEN", "")
-    saved_minutes_db_id = os.getenv("NOTION_MINUTES_DB_ID", "")
-    saved_todos_db_id = os.getenv("NOTION_TODOS_DB_ID", "")
+    saved_ai_key = get_secret("GROQ_API_KEY", "")
+    saved_notion_token = get_secret("NOTION_API_TOKEN", "")
+    saved_minutes_db_id = get_secret("NOTION_MINUTES_DB_ID", "")
+    saved_todos_db_id = get_secret("NOTION_TODOS_DB_ID", "")
 
     with st.expander("🔑 API 키 설정", expanded=not (saved_ai_key and saved_notion_token)):
         ai_api_key = st.text_input("Groq API Key", value=saved_ai_key, type="password")
@@ -961,30 +973,89 @@ with st.sidebar:
                     "🚫 봇이 초대된 빈 페이지를 찾을 수 없습니다. 노션에서 새 페이지를 만들고 연결 추가(Connect to)를 해주세요!"
                 )
 
-uploaded_audio = st.file_uploader("회의 음성 파일을 업로드하세요", type=["mp3", "wav", "m4a", "flac", "ogg"])
+# --- 모바일 안전 세션 상태 초기화 ---
+if "uploader_key" not in st.session_state:
+    st.session_state["uploader_key"] = 0
+if "cached_audio_bytes" not in st.session_state:
+    st.session_state["cached_audio_bytes"] = None
+if "cached_audio_name" not in st.session_state:
+    st.session_state["cached_audio_name"] = None
 
-if st.button("분석 및 노션 업데이트 시작", type="primary") and uploaded_audio:
+col_opts1, col_opts2 = st.columns([3, 2])
+with col_opts1:
+    st.markdown("### 🎙️ 회의 음성 파일 업로드")
+with col_opts2:
+    allow_all_formats = st.checkbox("모든 확장자 허용", value=False, help="아이폰/갤럭시에서 특정 녹음 파일이 비활성화될 때 체크하세요.")
+
+AUDIO_EXTENSIONS = ["mp3", "wav", "m4a", "aac", "ogg", "flac", "mp4", "m4v", "wma", "amr", "caf", "3gp", "webm"]
+type_filter = None if allow_all_formats else AUDIO_EXTENSIONS
+
+uploaded_audio = st.file_uploader(
+    "음성 파일을 선택하거나 끌어다 놓으세요 (최대 500MB 지원)",
+    type=type_filter,
+    key=f"audio_uploader_{st.session_state['uploader_key']}",
+    help="mp3, m4a(아이폰/갤럭시 통화녹음), wav, aac, amr, caf 등 다양한 오디오 형식을 완벽 지원합니다."
+)
+
+if uploaded_audio is not None:
+    try:
+        raw_bytes = uploaded_audio.getvalue()
+        if raw_bytes and len(raw_bytes) > 0:
+            st.session_state["cached_audio_bytes"] = raw_bytes
+            st.session_state["cached_audio_name"] = uploaded_audio.name
+    except Exception as e:
+        st.warning(f"파일을 읽는 중 경미한 지연이 발생했습니다: {e}")
+
+has_cached_audio = (
+    st.session_state.get("cached_audio_bytes") is not None
+    and len(st.session_state["cached_audio_bytes"]) > 0
+)
+
+if has_cached_audio:
+    c_bytes = st.session_state["cached_audio_bytes"]
+    c_name = st.session_state["cached_audio_name"]
+    file_size_mb = len(c_bytes) / (1024 * 1024)
+
+    st.success(f"📱 **음성 파일 업로드 성공**: `{c_name}` ({file_size_mb:.2f} MB)")
+    
+    col_play, col_clear = st.columns([3, 1])
+    with col_play:
+        st.audio(c_bytes)
+    with col_clear:
+        if st.button("🗑️ 다른 파일 올리기", type="secondary"):
+            st.session_state["cached_audio_bytes"] = None
+            st.session_state["cached_audio_name"] = None
+            st.session_state["uploader_key"] += 1
+            st.rerun()
+
+start_btn = st.button(
+    "🚀 분석 및 노션 업데이트 시작",
+    type="primary",
+    disabled=not has_cached_audio,
+    use_container_width=True
+)
+
+if start_btn:
     if not all([ai_api_key, notion_token, notion_minutes_db_id, notion_todos_db_id]):
         st.error("좌측 설정 탭에서 API Key와 DB가 완벽히 설정되지 않았습니다.")
+    elif not has_cached_audio:
+        st.warning("먼저 음성 파일을 업로드해 주세요.")
     else:
         with st.spinner("🎵 오디오 파일을 분석하고 있습니다... (시간이 소요될 수 있습니다)"):
-            ext = uploaded_audio.name.split(".")[-1].lower()
-            mime_types_map = {
-                "mp3": "audio/mp3",
-                "wav": "audio/wav",
-                "m4a": "audio/mp4",
-                "flac": "audio/flac",
-                "ogg": "audio/ogg",
-            }
-            mime_type = mime_types_map.get(ext, "audio/mpeg")
+            c_bytes = st.session_state["cached_audio_bytes"]
+            c_name = st.session_state["cached_audio_name"]
+            ext = c_name.split(".")[-1].lower() if "." in c_name else "mp3"
+            if len(ext) > 5 or not ext.isalnum():
+                ext = "mp3"
 
+            tmp_path = None
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}") as tmp_file:
-                tmp_file.write(uploaded_audio.read())
+                tmp_file.write(c_bytes)
                 tmp_path = tmp_file.name
 
             try:
                 progress_box = st.empty()
-                result = process_audio(ai_api_key, tmp_path, uploaded_audio.name, lambda m: progress_box.info(m))
+                result = process_audio(ai_api_key, tmp_path, c_name, lambda m: progress_box.info(m))
                 progress_box.empty()
                 st.success("✅ 분석 완료! 노션에 업로드를 시작합니다.")
 
@@ -1026,4 +1097,8 @@ if st.button("분석 및 노션 업데이트 시작", type="primary") and upload
             except Exception as e:
                 st.error(f"오류가 발생했습니다: {e}")
             finally:
-                os.remove(tmp_path)
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
