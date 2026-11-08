@@ -1,13 +1,18 @@
 import os
 import re
+import json
+import glob
+import hmac
+import subprocess
 import time
 import tempfile
 from datetime import datetime
 from typing import List
 import requests
 import streamlit as st
-from google import genai
-from google.genai import types
+import openai
+from openai import OpenAI
+import imageio_ffmpeg
 from pydantic import BaseModel
 from notion_client import Client
 from dotenv import load_dotenv, set_key
@@ -16,6 +21,20 @@ env_path = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(env_path)
 
 DEPARTMENTS = ["NW망", "DC운영", "DC구축", "재무/투자심의", "전략기획", "법무", "구매", "영업", "경영진"]
+
+# AI 설정: 기본은 Groq 무료 플랜(OpenAI 호환 API). 환경변수로 교체 가능.
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1")
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-large-v3-turbo")
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
+TPM_BUDGET = int(os.getenv("TPM_BUDGET", "6500"))  # 무료 8,000 TPM 보다 여유 있게
+DIRECT_MAX_CHARS = 3000      # 이보다 짧으면 요약 단계 없이 바로 구조화
+PIECE_MAX_CHARS = 4500       # 구간 요약 입력 최대 글자 수
+NOTES_TOTAL_CHARS = 2400     # 구간 요약 노트 전체 합계(최종 호출 토큰 제한 대응)
+TRANSCRIBE_HINT = (
+    "통신/데이터센터 사업개발 대화입니다. 용어 예시: DCI, ROADM, OLS, Dark Fiber, Subsea Cable, PNI, "
+    "상면, 수전, 액침냉각, DBO, AICC, EICN, PBX, CTI, IVR, CSP, CAPEX, RFS, 파주, 용인"
+)
+
 MEETING_STATUS_OPTIONS = [
     {"name": "논의 완료", "color": "green"},
     {"name": "후속 협의 필요", "color": "yellow"},
@@ -288,112 +307,210 @@ def create_dbs_in_page(notion_token, min_page_id, todo_page_id):
     return min_db_id, todo_db["id"]
 
 
-def process_audio(api_key, audio_file_path, mime_type, original_filename=""):
-    client = genai.Client(api_key=api_key)
+class TokenLimiter:
+    """무료 플랜의 분당 토큰(TPM) 제한에 걸리지 않도록 호출 간격을 조절합니다."""
+
+    def __init__(self, budget: int, window: float = 60.0):
+        self.budget = budget
+        self.window = window
+        self.events = []
+
+    def wait_for(self, est_tokens: int, progress=None):
+        while True:
+            now = time.time()
+            self.events = [(t, n) for t, n in self.events if now - t < self.window]
+            used = sum(n for _, n in self.events)
+            if used + est_tokens <= self.budget or not self.events:
+                return
+            wait = max(1.0, self.window - (now - self.events[0][0]) + 0.5)
+            if progress:
+                progress(f"⏳ 무료 사용량(분당 토큰) 보호를 위해 {int(wait)}초 대기 중입니다...")
+            time.sleep(min(wait, 15))
+
+    def record(self, tokens: int):
+        self.events.append((time.time(), tokens))
+
+
+def est_tokens(text: str) -> int:
+    # 한글은 토큰이 많이 소모되므로 보수적으로 추정
+    return int(len(text) / 1.1) + 50
+
+
+def split_text(text: str, max_chars: int) -> List[str]:
+    pieces, buf = [], ""
+    for sentence in re.split(r"(?<=[.!?。\n])\s*", text):
+        if not sentence:
+            continue
+        while len(sentence) > max_chars:  # 마침표 없이 매우 긴 구간 방어
+            if buf:
+                pieces.append(buf)
+                buf = ""
+            pieces.append(sentence[:max_chars])
+            sentence = sentence[max_chars:]
+        if len(buf) + len(sentence) + 1 > max_chars and buf:
+            pieces.append(buf)
+            buf = ""
+        buf = f"{buf} {sentence}".strip()
+    if buf:
+        pieces.append(buf)
+    return pieces
+
+
+def split_audio_to_chunks(src_path: str, workdir: str, chunk_seconds: int = 600) -> List[str]:
+    """업로드된 음성을 16kHz 모노 저용량 mp3 조각(기본 10분)으로 변환/분할합니다.
+    전사 API의 파일 크기 제한을 피하고, 긴 통화도 안정적으로 처리하기 위함입니다."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    out_pattern = os.path.join(workdir, "chunk_%03d.mp3")
+    cmd = [
+        ffmpeg_exe, "-y", "-i", src_path,
+        "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+        "-f", "segment", "-segment_time", str(chunk_seconds), "-reset_timestamps", "1",
+        out_pattern,
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        tail = proc.stderr.decode("utf-8", errors="ignore")[-500:]
+        raise RuntimeError(f"오디오 변환(ffmpeg)에 실패했습니다: {tail}")
+    chunks = sorted(glob.glob(os.path.join(workdir, "chunk_*.mp3")))
+    if not chunks:
+        raise RuntimeError("오디오에서 음성 구간을 찾지 못했습니다. 파일이 손상되지 않았는지 확인해 주세요.")
+    return chunks
+
+
+def transcribe_audio(client: OpenAI, audio_file_path: str, progress=None) -> str:
+    texts = []
+    with tempfile.TemporaryDirectory() as workdir:
+        chunks = split_audio_to_chunks(audio_file_path, workdir)
+        for i, chunk_path in enumerate(chunks, 1):
+            if progress:
+                progress(f"🎙️ 음성을 텍스트로 변환 중... ({i}/{len(chunks)})")
+            with open(chunk_path, "rb") as f:
+                res = client.audio.transcriptions.create(
+                    model=TRANSCRIBE_MODEL,
+                    file=f,
+                    language="ko",
+                    prompt=TRANSCRIBE_HINT,
+                )
+            texts.append((res.text or "").strip())
+    return "\n".join(t for t in texts if t)
+
+
+def _llm_kwargs() -> dict:
+    # gpt-oss 계열은 추론 토큰을 많이 쓰므로 최소로 낮춰 무료 한도를 아낍니다.
+    return {"extra_body": {"reasoning_effort": "low"}} if "gpt-oss" in LLM_MODEL else {}
+
+
+def summarize_piece(client, limiter, piece: str, idx: int, total: int, max_chars: int, progress=None) -> str:
+    system = (
+        f"회의/통화 녹취 일부({idx}/{total})입니다. 핵심만 한국어 불릿 노트로 정리하세요. "
+        "포함: 사실·수치·일정·결정사항·액션(담당자/기한)·고객사/사업 현황·사내 동향(본론과 무관한 내용은 [사내동향] 표시). "
+        "음성인식 오인식은 문맥에 맞게 보정하고, 불확실하면 (확인 필요)를 붙이세요. "
+        f"마크다운 기호 없이 {max_chars}자 이내로 쓰세요."
+    )
+    limiter.wait_for(est_tokens(system + piece) + 1000, progress)
+    res = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": piece}],
+        max_completion_tokens=1000,
+        **_llm_kwargs(),
+    )
+    limiter.record(res.usage.total_tokens if getattr(res, "usage", None) else est_tokens(system + piece) + 600)
+    note = (res.choices[0].message.content or "").strip()
+    return note[: int(max_chars * 1.4)]
+
+
+def build_system_prompt(original_filename: str, file_date: str, formatted_date: str) -> str:
+    return f"""
+당신은 LG유플러스 글로벌 AI/DC 인프라·엔터프라이즈(AICC/콜센터 인프라) 사업개발 수석 전문가이자 비서입니다.
+아래 회의/통화 자료로 노션 회의록 데이터와 To-Do를 JSON 스키마대로 작성하세요. 읽는 사람이 30초 안에 핵심을 파악하고 필요할 때만 상세를 펼쳐볼 수 있어야 합니다.
+자료는 음성인식 결과라 오인식이 있을 수 있으니 통신/DC 용어(DCI, ROADM, OLS, Dark Fiber, PNI, 상면/수전, 액침냉각, DBO 등)는 문맥에 맞게 보정하세요.
+[원본 파일명] {original_filename}
+[공통] 모든 문자열에 마크다운 기호(#, **, ---, *)를 넣지 마세요.
+[제목/속성] meeting_title은 "[YYMMDD] 회의 주제" 형식이며 날짜는 파일명 기준 {file_date}를 반영하고 '[날짜미상]'은 금지. meeting_datetime 기본값 "{formatted_date}". participants=대화자(불확실하면 "(확인 필요)"). purpose=1줄. meeting_status는 "논의 완료","후속 협의 필요","진행 중","검토 대기" 중 1개.
+[요약 콜아웃] summary_opportunity(핵심 기회), summary_schedule(가장 중요한 일정), summary_next_action(다음 액션 1개)는 각 1줄.
+[2열 요약] customer_status_summary: keyword=라벨, description=수치·현황 1줄. timeline_summary: keyword=시기(예 "3월 결산"), description=이벤트. 각 최대 4개.
+[주요 논의] discussion_topics 2~4개. topic_title 예 "1. 현행 인프라 현황". bullets는 최대 4개이며 각 keyword(굵게 표시될 핵심어)+description(한두 줄, 명사형 간결체).
+[액션 표] action_items_table: assignee, task, deadline(예 "10/20", 없으면 "미정"), status(예 "진행 예정").
+[기타 사내 동향] other_internal_trends: 회의 본론과 무관한 사내 소식·인사·타 프로젝트 언급은 모두 여기로. 없으면 빈 배열.
+[스타일] 고유명사·회사명·솔루션명은 첫 등장 시에만 괄호로 짧게 설명. 약어(EICN, AICC, CTI, IVR, PBX 등)는 첫 등장 시 풀네임 병기. 자료에서 확인되지 않는 내용은 추측하지 말고 "(확인 필요)". 전체 분량은 A4 1~1.5장 이내로 압축.
+[todos] category는 "CSP / 고객사","내부 유관부서","투자 / 경영진 보고","팀 내 실무" 중 1개. related_departments는 NW망, DC운영, DC구축, 재무/투자심의, 전략기획, 법무, 구매, 영업, 경영진 중 선택(없으면 빈 배열).
+"""
+
+
+def structure_meeting(client, limiter, material: str, system_prompt: str, progress=None) -> MeetingResult:
+    user_prompt = f"[회의/통화 자료]\n{material}"
+    limiter.wait_for(est_tokens(system_prompt + user_prompt) + 800 + 3000, progress)
+    parse_fn = getattr(client.chat.completions, "parse", None) or client.beta.chat.completions.parse
+    try:
+        completion = parse_fn(
+            model=LLM_MODEL,
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            response_format=MeetingResult,
+            max_completion_tokens=3000,
+            **_llm_kwargs(),
+        )
+        limiter.record(completion.usage.total_tokens if getattr(completion, "usage", None) else 7000)
+        parsed = completion.choices[0].message.parsed
+        if parsed is not None:
+            return parsed
+    except openai.BadRequestError:
+        pass  # strict json_schema 미지원/생성 실패 → 아래 json_object 방식으로 재시도
+
+    schema_txt = json.dumps(MeetingResult.model_json_schema(), ensure_ascii=False)
+    completion = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt + "\n반드시 아래 JSON 스키마를 만족하는 JSON만 출력하세요.\n" + schema_txt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+        max_completion_tokens=3000,
+        **_llm_kwargs(),
+    )
+    limiter.record(completion.usage.total_tokens if getattr(completion, "usage", None) else 7000)
+    return MeetingResult.model_validate_json(completion.choices[0].message.content or "{}")
+
+
+def process_audio(api_key, audio_file_path, original_filename="", progress=None):
+    client = OpenAI(api_key=api_key, base_url=AI_BASE_URL, max_retries=5, timeout=600)
+    limiter = TokenLimiter(TPM_BUDGET)
     file_date = extract_date_from_filename(original_filename)
     formatted_date = f"20{file_date[:2]}-{file_date[2:4]}-{file_date[4:6]}"
 
-    uploaded_file = client.files.upload(file=audio_file_path, config={"mime_type": mime_type})
+    try:
+        transcript = transcribe_audio(client, audio_file_path, progress)
+        if len(transcript.strip()) < 20:
+            raise RuntimeError("음성에서 전사된 내용이 거의 없습니다. 녹음 파일을 확인해 주세요.")
 
-    prompt = f"""
-    당신은 LG유플러스의 '글로벌 AI/Data Center 인프라 및 엔터프라이즈(AICC/콜센터 인프라 등) Business Development 수석 전문가'이자 전담 비서입니다.
-    업로드된 회의/통화 녹음 파일을 분석하여 **읽는 사람이 30초 안에 핵심을 파악하고, 필요할 때만 상세 내용을 펼쳐볼 수 있는 노션 회의록 데이터**와 **To-Do 리스트**를 JSON 스키마에 맞춰 생성하세요.
+        # 짧은 통화는 바로 구조화, 긴 통화는 구간별 요약 후 합쳐서 구조화 (무료 플랜 토큰 제한 대응)
+        if len(transcript) <= DIRECT_MAX_CHARS:
+            material = transcript
+        else:
+            pieces = split_text(transcript, PIECE_MAX_CHARS)
+            max_chars = max(300, min(900, NOTES_TOTAL_CHARS // len(pieces)))
+            notes = []
+            for i, piece in enumerate(pieces, 1):
+                if progress:
+                    progress(f"🧠 내용을 구간별로 정리 중... ({i}/{len(pieces)})")
+                notes.append(f"[구간 {i}/{len(pieces)}]\n" + summarize_piece(client, limiter, piece, i, len(pieces), max_chars, progress))
+            material = "\n\n".join(notes)
 
-    [업로드 원본 파일명] {original_filename}
-
-    ================================================================
-    [회의록 페이지 구조 및 작성 규칙 - 절대 준수]
-    ================================================================
-    * 절대 주의: 모든 문자열에 마크다운 기호(#, **, ---, * 등)를 직접 넣지 마세요! (코드에서 노션 네이티브 블록 및 볼드 속성으로 자동 변환합니다.)
-
-    1. 제목 및 상단 속성 (Properties)
-    - meeting_title: 반드시 "[YYMMDD] 회의 주제" 형식 (예: [{file_date}] 미쓰비시 콜센터 인프라 개편 및 AICC 제안 협의)
-      * 날짜 6자리(YYMMDD)는 파일명('{original_filename}')에서 추출한 '{file_date}'를 최우선 반영하세요. 절대 '[날짜미상]'을 쓰지 마세요.
-    - meeting_datetime: 회의 일시 (파일명 기준 기본값: "{formatted_date}", 통화 시간이나 언급된 시간이 있으면 함께 표기)
-    - participants: 대화자 (파일명 및 음성에서 파악된 참석자 이름/직책/소속, 불확실하면 "(확인 필요)" 병기)
-    - purpose: 회의 목적을 1줄로 간결하게 요약
-    - meeting_status: "논의 완료", "후속 협의 필요", "진행 중", "검토 대기" 중 가장 적절한 1개 선택
-
-    2. 상단 요약 콜아웃 (3줄 이내 "한 줄 결론")
-    - summary_opportunity: 핵심 기회 (1줄 요약)
-    - summary_schedule: 가장 중요한 일정 (1줄 요약)
-    - summary_next_action: 가장 시급한 다음 액션 1개 (1줄 요약)
-
-    3. 핵심 숫자·일정 (2열 컬럼 레이아웃용, 각 최대 4개 항목)
-    - customer_status_summary (왼쪽 컬럼 - 고객/사업 현황 요약):
-      * keyword: 항목 라벨 (예: "좌석 규모", "현행 인프라", "예산 규모")
-      * description: 수치 및 핵심 현황을 1줄로 요약 (불확실한 수치는 "(확인 필요)" 표시)
-    - timeline_summary (오른쪽 컬럼 - 타임라인):
-      * keyword: 날짜 또는 시기 (예: "3월 결산", "4월 초", "10월 말" - 노션에서 자동으로 굵게 표시됨)
-      * description: 해당 시점의 일정/이벤트 설명 (예: "예산 집행 및 구축 착수" - 일반 글씨로 표시됨)
-
-    4. 주요 논의 내용 (discussion_topics)
-    - 주제별로 2~4개의 토글 헤딩(H2) 주제로 구성하세요 (topic_title 예: "1. 콜센터 인프라 현황 및 개편 방향").
-    - 각 주제(bullets) 안에서는 불릿을 **최대 4개**로 엄격히 제한하고, 한 불릿은 **한두 줄 이내**로 압축하세요.
-    - 각 불릿은 keyword(앞에 굵게 표시될 핵심 키워드)와 description(콜론 뒤에 일반 글씨로 이어질 짧은 설명)으로 나누어 작성하세요.
-    - 긴 서술형 문장은 짧게 끊어 명사형/간결체로 작성하세요.
-
-    5. 의사결정 / 액션 아이템 표 (action_items_table)
-    - 체크박스 표에 들어갈 항목들입니다 (담당자 / 할 일 / 기한 / 상태).
-    - assignee: 담당자 이름 (불명확하면 "(확인 필요)")
-    - task: 구체적인 할 일 내용 (기한 날짜는 deadline 필드에 적으면 코드에서 할 일 맨 앞에 자동 배치합니다)
-    - deadline: 기한 (예: "10/20", "10월 말", 없으면 "미정")
-    - status: 상태 (예: "진행 예정", "검토 중", "확인 필요")
-
-    6. 기타 사내 동향 (other_internal_trends)
-    - 회의 본론과 관계없는 사내 동향, 인사/조직 소식, 타 프로젝트 언급, 가벼운 근황 등은 본문에 절대 섞지 말고 반드시 여기로 이동하세요.
-    - keyword(주제 키워드)와 description(간결한 설명)으로 작성하세요. 해당 내용이 전혀 없으면 빈 배열([])로 두세요.
-
-    ================================================================
-    [스타일 및 용어 규칙 - 절대 준수]
-    ================================================================
-    - 고유명사·회사명·솔루션명은 keyword가 아닌 일반 문장 안에서 볼드(**) 처리하지 말고, 첫 등장 시에만 괄호로 간단한 설명을 추가하세요.
-    - 약어(EICN, AICC, CTI, IVR, PBX, DCI, ROADM, OLS, Dark Fiber, PNI, DBO 등)는 첫 등장 시 반드시 풀네임을 병기하세요. (예: AICC(AI Contact Center), PBX(사설교환기))
-    - 불확실하거나 전사본(음성)에서 정확히 확인이 안 되는 수치·일정·내용은 추측하지 말고 반드시 "(확인 필요)"를 표시하세요.
-    - 전체 분량이 A4 1~1.5장 이내로 들어오도록 군더더기 없이 핵심만 압축하세요.
-
-    ================================================================
-    [To-Do 통합 현황 DB 누적용 (todos)]
-    ================================================================
-    - category는 반드시 다음 4가지 중 하나로만 분류:
-      1. "CSP / 고객사"
-      2. "내부 유관부서"
-      3. "투자 / 경영진 보고"
-      4. "팀 내 실무"
-    - related_departments: 협업/보고가 필요한 사내 부서 배열 (가급적 NW망, DC운영, DC구축, 재무/투자심의, 전략기획, 법무, 구매, 영업, 경영진 중 선택, 없으면 빈 배열)
-    """
-
-    max_retries = 10
-    retry_delay = 5
-
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=[uploaded_file, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=MeetingResult,
-                    temperature=0.2,
-                ),
-            )
-            break
-        except Exception as e:
-            if "503" in str(e) and attempt < max_retries - 1:
-                st.warning(
-                    f"구글 서버가 현재 꽉 찼습니다. 포기하지 않고 {retry_delay}초 후 다시 서버 문을 두드립니다... (불굴의 시도 {attempt+1}/{max_retries})"
-                )
-                time.sleep(retry_delay)
-                retry_delay += 5
-            else:
-                client.files.delete(name=uploaded_file.name)
-                raise e
-
-    client.files.delete(name=uploaded_file.name)
-    parsed = response.parsed
+        if progress:
+            progress("📝 회의록과 To-Do를 작성 중...")
+        system_prompt = build_system_prompt(original_filename, file_date, formatted_date)
+        parsed = structure_meeting(client, limiter, material, system_prompt, progress)
+    except openai.RateLimitError as e:
+        raise RuntimeError(
+            "AI 무료 사용 한도(분당/일일)를 초과했습니다. 잠시 뒤에 다시 시도하거나, 일일 한도라면 내일 다시 시도해 주세요. "
+            f"(상세: {str(e)[:300]})"
+        )
+    except openai.APIStatusError as e:
+        if getattr(e, "status_code", None) == 413:
+            raise RuntimeError("녹음이 너무 길어 무료 한도의 요청 크기를 넘었습니다. 파일을 나눠서 올려 주세요.")
+        raise
 
     # 제목 날짜 검증 및 보정 (2중 안전장치)
-    if parsed and parsed.meeting_title:
+    if parsed.meeting_title:
         clean_title = clean_md(parsed.meeting_title)
         if "[날짜미상]" in clean_title:
             parsed.meeting_title = clean_title.replace("[날짜미상]", f"[{file_date}]")
@@ -755,6 +872,18 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+if APP_PASSWORD and not st.session_state.get("authed"):
+    st.title("🔒 접속 비밀번호")
+    _pw = st.text_input("비밀번호를 입력하세요", type="password")
+    if _pw:
+        if hmac.compare_digest(_pw, APP_PASSWORD):
+            st.session_state["authed"] = True
+            st.rerun()
+        else:
+            st.error("비밀번호가 틀렸습니다.")
+    st.stop()
+
 st.title("🎧 음성 회의록 & To-Do 생성기")
 st.markdown(
     "<p style='color: #B3B3B3; font-size: 0.9rem;'>회의 음성 파일을 업로드하면 30초 핵심 파악용 노션 네이티브 회의록과 To-Do로 자동 정리해 드립니다.</p>",
@@ -764,19 +893,19 @@ st.markdown(
 with st.sidebar:
     st.header("⚙️ 설정 (Settings)")
 
-    saved_gemini_key = os.getenv("GEMINI_API_KEY", "")
+    saved_ai_key = os.getenv("GROQ_API_KEY", "")
     saved_notion_token = os.getenv("NOTION_API_TOKEN", "")
     saved_minutes_db_id = os.getenv("NOTION_MINUTES_DB_ID", "")
     saved_todos_db_id = os.getenv("NOTION_TODOS_DB_ID", "")
 
-    with st.expander("🔑 API 키 설정", expanded=not (saved_gemini_key and saved_notion_token)):
-        gemini_api_key = st.text_input("Gemini API Key", value=saved_gemini_key, type="password")
+    with st.expander("🔑 API 키 설정", expanded=not (saved_ai_key and saved_notion_token)):
+        ai_api_key = st.text_input("Groq API Key", value=saved_ai_key, type="password")
         notion_token = st.text_input("Notion API Token", value=saved_notion_token, type="password")
 
         if st.button("💾 모바일 자동 로그인을 위해 키 저장하기", type="secondary"):
             if not os.path.exists(env_path):
                 open(env_path, "a").close()
-            set_key(env_path, "GEMINI_API_KEY", gemini_api_key)
+            set_key(env_path, "GROQ_API_KEY", ai_api_key)
             set_key(env_path, "NOTION_API_TOKEN", notion_token)
             st.success("✅ 키가 저장되었습니다! 모바일로 접속해도 유지됩니다.")
 
@@ -835,7 +964,7 @@ with st.sidebar:
 uploaded_audio = st.file_uploader("회의 음성 파일을 업로드하세요", type=["mp3", "wav", "m4a", "flac", "ogg"])
 
 if st.button("분석 및 노션 업데이트 시작", type="primary") and uploaded_audio:
-    if not all([gemini_api_key, notion_token, notion_minutes_db_id, notion_todos_db_id]):
+    if not all([ai_api_key, notion_token, notion_minutes_db_id, notion_todos_db_id]):
         st.error("좌측 설정 탭에서 API Key와 DB가 완벽히 설정되지 않았습니다.")
     else:
         with st.spinner("🎵 오디오 파일을 분석하고 있습니다... (시간이 소요될 수 있습니다)"):
@@ -854,7 +983,9 @@ if st.button("분석 및 노션 업데이트 시작", type="primary") and upload
                 tmp_path = tmp_file.name
 
             try:
-                result = process_audio(gemini_api_key, tmp_path, mime_type, uploaded_audio.name)
+                progress_box = st.empty()
+                result = process_audio(ai_api_key, tmp_path, uploaded_audio.name, lambda m: progress_box.info(m))
+                progress_box.empty()
                 st.success("✅ 분석 완료! 노션에 업로드를 시작합니다.")
 
                 st.subheader(f"📝 {result.meeting_title}")

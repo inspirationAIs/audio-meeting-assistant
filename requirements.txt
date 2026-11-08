@@ -1,6 +1,7 @@
 streamlit
-google-genai
+openai
 notion-client
 python-dotenv
 requests
 pydantic
+imageio-ffmpeg
