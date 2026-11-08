@@ -981,20 +981,13 @@ if "cached_audio_bytes" not in st.session_state:
 if "cached_audio_name" not in st.session_state:
     st.session_state["cached_audio_name"] = None
 
-col_opts1, col_opts2 = st.columns([3, 2])
-with col_opts1:
-    st.markdown("### 🎙️ 회의 음성 파일 업로드")
-with col_opts2:
-    allow_all_formats = st.checkbox("모든 확장자 허용", value=False, help="아이폰/갤럭시에서 특정 녹음 파일이 비활성화될 때 체크하세요.")
-
-AUDIO_EXTENSIONS = ["mp3", "wav", "m4a", "aac", "ogg", "flac", "mp4", "m4v", "wma", "amr", "caf", "3gp", "webm"]
-type_filter = None if allow_all_formats else AUDIO_EXTENSIONS
+st.markdown("### 🎙️ 회의 음성 파일 업로드")
 
 uploaded_audio = st.file_uploader(
     "음성 파일을 선택하거나 끌어다 놓으세요 (최대 500MB 지원)",
-    type=type_filter,
+    type=None,
     key=f"audio_uploader_{st.session_state['uploader_key']}",
-    help="mp3, m4a(아이폰/갤럭시 통화녹음), wav, aac, amr, caf 등 다양한 오디오 형식을 완벽 지원합니다."
+    help="mp3, m4a(아이폰/갤럭시 통화녹음), wav, aac, amr, caf 등 모든 오디오 형식을 완벽 지원합니다."
 )
 
 if uploaded_audio is not None:
